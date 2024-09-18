@@ -3,7 +3,7 @@ module github.com/deepgram-starters/text-to-speech-starter-go
 go 1.19
 
 require (
-	github.com/deepgram/deepgram-go-sdk v1.6.0-dev.2
+	github.com/deepgram/deepgram-go-sdk v1.6.0
 	github.com/gorilla/websocket v1.5.3
 )
 
