@@ -83,6 +83,11 @@ func (dch MyHandler) GetUnhandled() []*chan *[]byte {
 	return []*chan *[]byte{}
 }
 
+// GetClear returns the clear channels
+func (dch MyHandler) GetClear() []*chan *msginterfaces.ClearedResponse {
+	return []*chan *msginterfaces.ClearedResponse{}
+}
+
 // Open is the callback for when the connection opens
 // golintci: funlen
 func (dch MyHandler) Run() error {
@@ -238,7 +243,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	if model == "" {
 		fmt.Println("No model specified, using default model")
-		model = "aura-asteria-en"
+		model = "aura-2-thalia-en"
 	}
 
 	// context
