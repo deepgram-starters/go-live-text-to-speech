@@ -28,3 +28,11 @@ _cgo_export.*
 _testmain.go
 .idea/
 *.iml
+
+# Environment variables
+.env
+.env.local
+.env.*
+
+# Testing
+test-results/
