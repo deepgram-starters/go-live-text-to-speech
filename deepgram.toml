@@ -2,8 +2,9 @@
   title = "Go Live Text-to-Speech Starter"
   description = "Get started using Deepgram's Live Text-to-Speech with this Go demo app"
   author = "Deepgram DX Team <devrel@deepgram.com> (https://developers.deepgram.com)"
-  useCase = "Live TTS"
-  language = "Go"
+  useCase = "live-text-to-speech"
+  language = "go"
+  tags = ["live-text-to-speech", "live-tts", "streaming-tts", "real-time-tts", "streaming-text-to-speech", "go"]
 
 [build]
   command = "go get"
