@@ -1,17 +1,51 @@
 [meta]
-  title = "Go Live Text-to-Speech Starter"
-  description = "Get started using Deepgram's Live Text-to-Speech with this Go demo app"
-  author = "Deepgram DX Team <devrel@deepgram.com> (https://developers.deepgram.com)"
-  useCase = "live-text-to-speech"
-  language = "go"
-  tags = ["live-text-to-speech", "live-tts", "streaming-tts", "real-time-tts", "streaming-text-to-speech", "go"]
+title = "Go Live Text-to-Speech"
+description = "Get started using Deepgram's Live Text-to-Speech with this Go demo app"
+author = "Deepgram DX Team <devrel@deepgram.com> (https://developers.deepgram.com)"
+repository = "https://github.com/deepgram-starters/go-live-text-to-speech"
+useCase = "live-text-to-speech"
+language = "go"
+framework = "go"
+sdk = "N/A"
+tags = ["live-text-to-speech", "live-tts", "streaming-tts", "real-time-tts", "streaming-text-to-speech", "go"]
 
-[build]
-  command = "go get"
+[check]
+command = ["command -v git", "command -v go", "command -v pnpm"]
+message = "Prerequisites checked"
 
-[config]
-  sample = "sample.env"
-  output = ".env"
+[install.pre]
+command = "git submodule update --init --recursive"
+message = "Submodules initialized"
 
-[post-build]
-  message = "Run `go run .` to get up and running."
+[install]
+command = ["go mod tidy", "cd frontend && corepack pnpm install"]
+message = "Dependencies installed"
+
+[install.config]
+sample = "sample.env"
+output = ".env"
+
+[start.pre]
+command = ["test -f .env || echo 'Error: .env file not found'", "test -d frontend/.git || echo 'Error: Frontend submodule not initialized'"]
+message = "Pre-flight checks complete"
+
+[start]
+command = ["go run main.go", "cd frontend && pnpm run dev -- --port 8080 --no-open"]
+parallel = true
+message = "Application running on http://localhost:8080"
+
+[update]
+command = "git submodule update --remote --merge"
+message = "Submodules updated"
+
+[clean]
+command = ["rm -rf frontend/node_modules", "rm -rf frontend/dist"]
+message = "Build artifacts cleaned"
+
+[eject-frontend]
+command = "make eject-frontend"
+message = "Frontend ejected successfully"
+
+[test]
+command = "echo 'No tests configured'"
+message = "Tests skipped"

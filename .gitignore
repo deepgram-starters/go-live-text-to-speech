@@ -1,38 +1,26 @@
-# Binaries for programs and plugins
-.DS_Store
+# Environment
+.env
+
+# Build output
+frontend/dist/
+go-live-text-to-speech
+
+# Go binaries and build artifacts
 *.exe
 *.exe~
 *.dll
-*.o
-*.a
 *.so
 *.dylib
 
-# Folders
-_obj
-_test
-*.test
+# Dependencies (frontend)
+node_modules/
 
-# Output of the go coverage tool, specifically when used with LiteIDE
-*.out
+# OS files
+.DS_Store
+Thumbs.db
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
-
-# cgo stuff
-*.cgo1.go
-*.cgo2.c
-_cgo_defun.c
-_cgo_gotypes.go
-_cgo_export.*
-_testmain.go
+# IDE
+.vscode/
 .idea/
-*.iml
-
-# Environment variables
-.env
-.env.local
-.env.*
-
-# Testing
-test-results/
+*.swp
+*.swo

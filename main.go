@@ -1,323 +1,405 @@
+/**
+ * Go Live Text-to-Speech Starter - Backend Server
+ *
+ * Simple WebSocket proxy to Deepgram's Live TTS API.
+ * Forwards all messages (JSON and binary) bidirectionally between client and Deepgram.
+ *
+ * Routes:
+ *   GET  /api/session                - Issue JWT session token
+ *   GET  /api/metadata               - Project metadata from deepgram.toml
+ *   WS   /api/live-text-to-speech    - WebSocket proxy to Deepgram TTS (auth required)
+ *   GET  /health                     - Health check
+ */
+
 package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/BurntSushi/toml"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
-
-	msginterfaces "github.com/deepgram/deepgram-go-sdk/pkg/api/speak/v1/websocket/interfaces"
-	clientinterfaces "github.com/deepgram/deepgram-go-sdk/pkg/client/interfaces"
-	client "github.com/deepgram/deepgram-go-sdk/pkg/client/speak"
+	"github.com/joho/godotenv"
 )
 
-type MyHandler struct {
-	binaryChan  chan *[]byte
-	openChan    chan *msginterfaces.OpenResponse
-	flushedChan chan *msginterfaces.FlushedResponse
-	closeChan   chan *msginterfaces.CloseResponse
-	errorChan   chan *msginterfaces.ErrorResponse
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
 
-	wsUI *websocket.Conn
+// Config holds the application configuration loaded from environment variables.
+type Config struct {
+	DeepgramAPIKey string
+	DeepgramTTSURL string
+	Port           string
+	Host           string
+	SessionSecret  string
 }
 
-func NewMyHandler(uiWebsocket *websocket.Conn) MyHandler {
-	handler := MyHandler{
-		binaryChan:  make(chan *[]byte),
-		openChan:    make(chan *msginterfaces.OpenResponse),
-		flushedChan: make(chan *msginterfaces.FlushedResponse),
-		closeChan:   make(chan *msginterfaces.CloseResponse),
-		errorChan:   make(chan *msginterfaces.ErrorResponse),
-		wsUI:        uiWebsocket,
+// loadConfig reads configuration from environment variables with sensible defaults.
+func loadConfig() Config {
+	// Load .env file (optional, won't error if missing)
+	_ = godotenv.Load()
+
+	apiKey := os.Getenv("DEEPGRAM_API_KEY")
+	if apiKey == "" {
+		log.Fatal("ERROR: DEEPGRAM_API_KEY environment variable is required\nPlease copy sample.env to .env and add your API key")
 	}
 
-	go func() {
-		handler.Run()
-	}()
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8081"
+	}
 
-	return handler
-}
+	host := os.Getenv("HOST")
+	if host == "" {
+		host = "0.0.0.0"
+	}
 
-// GetUnhandled returns the binary event channels
-func (dch MyHandler) GetBinary() []*chan *[]byte {
-	return []*chan *[]byte{&dch.binaryChan}
-}
-
-// GetOpen returns the open channels
-func (dch MyHandler) GetOpen() []*chan *msginterfaces.OpenResponse {
-	return []*chan *msginterfaces.OpenResponse{&dch.openChan}
-}
-
-// GetMetadata returns the metadata channels
-func (dch MyHandler) GetMetadata() []*chan *msginterfaces.MetadataResponse {
-	return []*chan *msginterfaces.MetadataResponse{}
-}
-
-// GetFlushed returns the flush channels
-func (dch MyHandler) GetFlush() []*chan *msginterfaces.FlushedResponse {
-	return []*chan *msginterfaces.FlushedResponse{&dch.flushedChan}
-}
-
-// GetClose returns the close channels
-func (dch MyHandler) GetClose() []*chan *msginterfaces.CloseResponse {
-	return []*chan *msginterfaces.CloseResponse{&dch.closeChan}
-}
-
-// GetWarning returns the warning channels
-func (dch MyHandler) GetWarning() []*chan *msginterfaces.WarningResponse {
-	return []*chan *msginterfaces.WarningResponse{}
-}
-
-// GetError returns the error channels
-func (dch MyHandler) GetError() []*chan *msginterfaces.ErrorResponse {
-	return []*chan *msginterfaces.ErrorResponse{&dch.errorChan}
-}
-
-// GetUnhandled returns the unhandled event channels
-func (dch MyHandler) GetUnhandled() []*chan *[]byte {
-	return []*chan *[]byte{}
-}
-
-// GetClear returns the clear channels
-func (dch MyHandler) GetClear() []*chan *msginterfaces.ClearedResponse {
-	return []*chan *msginterfaces.ClearedResponse{}
-}
-
-// Open is the callback for when the connection opens
-// golintci: funlen
-func (dch MyHandler) Run() error {
-	wgReceivers := sync.WaitGroup{}
-
-	// open channel
-	wgReceivers.Add(1)
-	go func() {
-		defer wgReceivers.Done()
-
-		for or := range dch.openChan {
-			fmt.Printf("------------ [OPEN] Deepgram WebSocket connection opened\n")
-
-			// Send metadata to the UI
-			openJSON, err := json.Marshal(or)
-			if err != nil {
-				log.Println("Failed to marshal open to JSON:", err)
-				continue
-			}
-
-			fmt.Printf("Open JSON: %s\n", openJSON)
-			dch.wsUI.WriteMessage(websocket.TextMessage, openJSON)
+	sessionSecret := os.Getenv("SESSION_SECRET")
+	if sessionSecret == "" {
+		b := make([]byte, 32)
+		if _, err := rand.Read(b); err != nil {
+			log.Fatal("Failed to generate session secret:", err)
 		}
-	}()
+		sessionSecret = hex.EncodeToString(b)
+	}
 
-	// flushed channel
-	wgReceivers.Add(1)
-	go func() {
-		defer wgReceivers.Done()
-
-		for fr := range dch.flushedChan {
-			fmt.Printf("------------ [FLUSHED] Final Binary\n")
-
-			// Send metadata to the UI
-			flushedJSON, err := json.Marshal(fr)
-			if err != nil {
-				log.Println("Failed to marshal flushed to JSON:", err)
-				continue
-			}
-
-			fmt.Printf("Flushed JSON: %s\n", flushedJSON)
-			dch.wsUI.WriteMessage(websocket.TextMessage, flushedJSON)
-		}
-	}()
-
-	// binary channel
-	wgReceivers.Add(1)
-	go func() {
-		defer wgReceivers.Done()
-
-		lastTime := time.Now().Add(-5 * time.Second)
-
-		for br := range dch.binaryChan {
-			if time.Since(lastTime) > 3*time.Second {
-				fmt.Printf("------------ [Binary Data] Attach header.\n")
-
-				// Add a wav audio container header to the file if you want to play the audio
-				// using the AudioContext or media player like VLC, Media Player, or Apple Music
-				// Without this header in the Chrome browser case, the audio will not play.
-				header := []byte{
-					0x52, 0x49, 0x46, 0x46, // "RIFF"
-					0x00, 0x00, 0x00, 0x00, // Placeholder for file size
-					0x57, 0x41, 0x56, 0x45, // "WAVE"
-					0x66, 0x6d, 0x74, 0x20, // "fmt "
-					0x10, 0x00, 0x00, 0x00, // Chunk size (16)
-					0x01, 0x00, // Audio format (1 for PCM)
-					0x01, 0x00, // Number of channels (1)
-					0x80, 0xbb, 0x00, 0x00, // Sample rate (48000)
-					0x00, 0xee, 0x02, 0x00, // Byte rate (48000 * 2)
-					0x02, 0x00, // Block align (2)
-					0x10, 0x00, // Bits per sample (16)
-					0x64, 0x61, 0x74, 0x61, // "data"
-					0x00, 0x00, 0x00, 0x00, // Placeholder for data size
-				}
-
-				dch.wsUI.WriteMessage(websocket.BinaryMessage, header)
-				lastTime = time.Now()
-			}
-
-			fmt.Printf("------------ [Binary Data] (len: %d)\n", len(*br))
-			dch.wsUI.WriteMessage(websocket.BinaryMessage, *br)
-		}
-	}()
-
-	// close channel
-	wgReceivers.Add(1)
-	go func() {
-		defer wgReceivers.Done()
-
-		for cr := range dch.closeChan {
-			fmt.Printf("------------ [Close] Deepgram WebSocket connection closed\n")
-
-			// Send metadata to the UI
-			closeJSON, err := json.Marshal(cr)
-			if err != nil {
-				log.Println("Failed to marshal close to JSON:", err)
-				continue
-			}
-
-			fmt.Printf("Close JSON: %s\n", closeJSON)
-			dch.wsUI.WriteMessage(websocket.TextMessage, closeJSON)
-		}
-	}()
-
-	// error channel
-	wgReceivers.Add(1)
-	go func() {
-		defer wgReceivers.Done()
-
-		for er := range dch.errorChan {
-			fmt.Printf("------------ [Error] ErrCode: %s\n", er.ErrCode)
-			fmt.Printf("ErrMsg: %s\n", er.ErrMsg)
-			fmt.Printf("Description: %s\n", er.Description)
-
-			// Send metadata to the UI
-			errorJSON, err := json.Marshal(er)
-			if err != nil {
-				log.Println("Failed to marshal error to JSON:", err)
-				continue
-			}
-
-			fmt.Printf("Error JSON: %s\n", errorJSON)
-			dch.wsUI.WriteMessage(websocket.TextMessage, errorJSON)
-		}
-	}()
-
-	// wait for all receivers to finish
-	wgReceivers.Wait()
-
-	return nil
+	return Config{
+		DeepgramAPIKey: apiKey,
+		DeepgramTTSURL: "wss://api.deepgram.com/v1/speak",
+		Port:           port,
+		Host:           host,
+		SessionSecret:  sessionSecret,
+	}
 }
 
+// ============================================================================
+// SESSION AUTH - JWT tokens for production security
+// ============================================================================
+
+const jwtExpiry = time.Hour
+
+// generateToken creates a signed JWT for session authentication.
+func generateToken(secret string) (string, error) {
+	claims := jwt.RegisteredClaims{
+		IssuedAt:  jwt.NewNumericDate(time.Now()),
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(jwtExpiry)),
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString([]byte(secret))
+}
+
+// validateToken verifies a JWT and returns an error if invalid.
+func validateToken(tokenString, secret string) error {
+	_, err := jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
+		return []byte(secret), nil
+	})
+	return err
+}
+
+// validateWsToken extracts and validates a JWT from WebSocket subprotocols.
+// Returns the full protocol string (e.g., "access_token.<jwt>") if valid.
+func validateWsToken(protocols []string, secret string) string {
+	for _, p := range protocols {
+		if strings.HasPrefix(p, "access_token.") {
+			tokenStr := strings.TrimPrefix(p, "access_token.")
+			if err := validateToken(tokenStr, secret); err == nil {
+				return p
+			}
+		}
+	}
+	return ""
+}
+
+// ============================================================================
+// METADATA
+// ============================================================================
+
+// DeepgramToml represents the parsed deepgram.toml structure.
+type DeepgramToml struct {
+	Meta map[string]interface{} `toml:"meta"`
+}
+
+// ============================================================================
+// WEBSOCKET PROXY
+// ============================================================================
+
+// upgrader configures the WebSocket upgrader. CheckOrigin allows all origins.
 var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
 }
 
-var requestData struct {
-	Text string `json:"text"`
-}
+// activeConnections tracks all active client WebSocket connections for graceful shutdown.
+var activeConnections sync.Map
 
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// get the model from the query string
-	model := r.URL.Query().Get("model")
+// handleLiveTTSProxy proxies WebSocket messages between the client and Deepgram's Live TTS API.
+func handleLiveTTSProxy(cfg Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Validate JWT from subprotocol
+		protocols := websocket.Subprotocols(r)
+		validProto := validateWsToken(protocols, cfg.SessionSecret)
+		if validProto == "" {
+			log.Println("WebSocket auth failed: invalid or missing token")
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
 
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println("Failed to upgrade connection to WebSocket:", err)
-		return
-	}
-	defer conn.Close()
-
-	if model == "" {
-		fmt.Println("No model specified, using default model")
-		model = "aura-2-thalia-en"
-	}
-
-	// context
-	ctx := context.Background()
-
-	// client options, if needed
-	cOptions := clientinterfaces.ClientOptions{}
-
-	// Create a new Deepgram WebSocket client
-	sOptions := clientinterfaces.WSSpeakOptions{
-		Model:      model,
-		Encoding:   "linear16",
-		SampleRate: 48000,
-	}
-	callback := NewMyHandler(conn)
-
-	wsClient, err := client.NewWSUsingChan(ctx, "", &cOptions, &sOptions, callback)
-	if err != nil {
-		log.Fatalf("Failed to create WebSocket client: %v", err)
-		return
-	}
-
-	// Wait for the connection to be established
-	isConnected := wsClient.Connect()
-	if !isConnected {
-		log.Fatalf("Failed to connect to Deepgram")
-		return
-	}
-
-	for {
-		// Read message from the WebSocket connection
-		msgType, message, err := conn.ReadMessage()
+		// Upgrade with the accepted subprotocol
+		responseHeader := http.Header{}
+		responseHeader.Set("Sec-WebSocket-Protocol", validProto)
+		clientConn, err := upgrader.Upgrade(w, r, responseHeader)
 		if err != nil {
-			log.Println("Failed to read message from WebSocket:", err)
-			break
+			log.Printf("WebSocket upgrade failed: %v", err)
+			return
+		}
+		defer clientConn.Close()
+
+		log.Println("Client connected to /api/live-text-to-speech")
+		activeConnections.Store(clientConn, true)
+		defer activeConnections.Delete(clientConn)
+
+		// Parse query parameters from the WebSocket URL
+		query := r.URL.Query()
+		model := query.Get("model")
+		if model == "" {
+			model = "aura-asteria-en"
+		}
+		encoding := query.Get("encoding")
+		if encoding == "" {
+			encoding = "linear16"
+		}
+		sampleRate := query.Get("sample_rate")
+		if sampleRate == "" {
+			sampleRate = "24000"
+		}
+		container := query.Get("container")
+		if container == "" {
+			container = "none"
 		}
 
-		if msgType == websocket.TextMessage {
-			err = json.Unmarshal(message, &requestData)
-			if err != nil {
-				log.Println("Failed to unmarshal JSON:", err)
-				continue
-			}
+		// Build Deepgram WebSocket URL with query parameters
+		deepgramURL, _ := url.Parse(cfg.DeepgramTTSURL)
+		q := deepgramURL.Query()
+		q.Set("model", model)
+		q.Set("encoding", encoding)
+		q.Set("sample_rate", sampleRate)
+		q.Set("container", container)
+		deepgramURL.RawQuery = q.Encode()
 
-			if requestData.Text == "" {
-				log.Println("Text is required in the request")
-				continue
-			}
+		log.Printf("Connecting to Deepgram TTS: model=%s, encoding=%s, sample_rate=%s", model, encoding, sampleRate)
 
-			log.Printf("Text: %s\n", requestData.Text)
+		// Create WebSocket connection to Deepgram
+		dgHeader := http.Header{}
+		dgHeader.Set("Authorization", "Token "+cfg.DeepgramAPIKey)
 
-			err = wsClient.SpeakWithText(requestData.Text)
-			if err != nil {
-				log.Println("Failed to send text to Deepgram:", err)
+		deepgramConn, resp, err := websocket.DefaultDialer.Dial(deepgramURL.String(), dgHeader)
+		if err != nil {
+			if resp != nil {
+				log.Printf("Deepgram rejected connection (%d)", resp.StatusCode)
+			} else {
+				log.Printf("Deepgram connection failed: %v", err)
 			}
-
-			err = wsClient.Flush()
-			if err != nil {
-				fmt.Printf("Error flushing: %v\n", err)
-				return
-			}
+			clientConn.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "Deepgram connection failed"))
+			return
 		}
+		defer deepgramConn.Close()
+
+		log.Println("Connected to Deepgram TTS API")
+
+		// done channel to coordinate goroutine shutdown
+		done := make(chan struct{})
+		var once sync.Once
+		closeDone := func() { once.Do(func() { close(done) }) }
+
+		// Forward messages: Deepgram -> Client
+		go func() {
+			defer closeDone()
+			for {
+				msgType, data, err := deepgramConn.ReadMessage()
+				if err != nil {
+					if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+						log.Println("Deepgram connection closed normally")
+					} else {
+						log.Printf("Deepgram read error: %v", err)
+					}
+					// Forward close to client
+					clientConn.WriteMessage(websocket.CloseMessage,
+						websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Deepgram disconnected"))
+					return
+				}
+
+				if err := clientConn.WriteMessage(msgType, data); err != nil {
+					log.Printf("Error forwarding to client: %v", err)
+					return
+				}
+			}
+		}()
+
+		// Forward messages: Client -> Deepgram
+		go func() {
+			defer closeDone()
+			for {
+				msgType, data, err := clientConn.ReadMessage()
+				if err != nil {
+					if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+						log.Println("Client disconnected normally")
+					} else {
+						log.Printf("Client read error: %v", err)
+					}
+					// Forward close to Deepgram
+					deepgramConn.WriteMessage(websocket.CloseMessage,
+						websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Client disconnected"))
+					return
+				}
+
+				if err := deepgramConn.WriteMessage(msgType, data); err != nil {
+					log.Printf("Error forwarding to Deepgram: %v", err)
+					return
+				}
+			}
+		}()
+
+		// Wait for either goroutine to finish
+		<-done
+		log.Println("WebSocket proxy session ended")
 	}
 }
+
+// ============================================================================
+// HTTP HANDLERS
+// ============================================================================
+
+// handleSession issues a signed JWT for session authentication.
+func handleSession(cfg Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token, err := generateToken(cfg.SessionSecret)
+		if err != nil {
+			http.Error(w, `{"error":"INTERNAL_SERVER_ERROR","message":"Failed to generate token"}`, http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"token": token})
+	}
+}
+
+// handleHealth returns a simple health check response.
+// GET /health
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// handleMetadata returns project metadata from deepgram.toml.
+func handleMetadata(w http.ResponseWriter, r *http.Request) {
+	var cfg DeepgramToml
+	if _, err := toml.DecodeFile("deepgram.toml", &cfg); err != nil {
+		log.Printf("Error reading deepgram.toml: %v", err)
+		http.Error(w, `{"error":"INTERNAL_SERVER_ERROR","message":"Failed to read metadata from deepgram.toml"}`, http.StatusInternalServerError)
+		return
+	}
+	if cfg.Meta == nil {
+		http.Error(w, `{"error":"INTERNAL_SERVER_ERROR","message":"Missing [meta] section in deepgram.toml"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(cfg.Meta)
+}
+
+// corsMiddleware adds CORS headers to all responses.
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
 
 func main() {
-	client.Init(client.InitLib{
-		LogLevel: client.LogLevelDefault, // LogLevelDefault, LogLevelFull, LogLevelDebug, LogLevelTrace
-	})
+	cfg := loadConfig()
 
-	fs := http.FileServer(http.Dir("./public"))
-	http.Handle("/", fs)
-	http.HandleFunc("/ws", handleWebSocket)
+	mux := http.NewServeMux()
 
-	fmt.Printf("Open the UI at http://localhost:3000\n")
-	log.Fatal(http.ListenAndServe(":3000", nil))
+	// API routes
+	mux.HandleFunc("GET /api/session", handleSession(cfg))
+	mux.HandleFunc("GET /api/metadata", handleMetadata)
+	mux.HandleFunc("GET /health", handleHealth)
+	mux.HandleFunc("/api/live-text-to-speech", handleLiveTTSProxy(cfg))
+
+	// Wrap with CORS middleware
+	handler := corsMiddleware(mux)
+
+	server := &http.Server{
+		Addr:    cfg.Host + ":" + cfg.Port,
+		Handler: handler,
+	}
+
+	// Graceful shutdown
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		sig := <-sigChan
+		log.Printf("\n%s signal received: starting graceful shutdown...", sig)
+
+		// Close all active WebSocket connections
+		count := 0
+		activeConnections.Range(func(key, value interface{}) bool {
+			conn := key.(*websocket.Conn)
+			conn.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseGoingAway, "Server shutting down"))
+			conn.Close()
+			count++
+			return true
+		})
+		log.Printf("Closed %d active WebSocket connection(s)", count)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("Server shutdown error: %v", err)
+		}
+		log.Println("Shutdown complete")
+	}()
+
+	log.Println(strings.Repeat("=", 70))
+	log.Printf("Backend API Server running at http://localhost:%s", cfg.Port)
+	log.Println("")
+	log.Println("GET  /api/session")
+	log.Println("WS   /api/live-text-to-speech (auth required)")
+	log.Println("GET  /api/metadata")
+	log.Println("GET  /health")
+	log.Println(strings.Repeat("=", 70))
+
+	if err := server.ListenAndServe(); err != http.ErrServerClosed {
+		log.Fatalf("Server failed: %v", err)
+	}
 }
