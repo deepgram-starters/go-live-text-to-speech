@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -163,6 +164,14 @@ var activeConnections sync.Map
 type ttsCallback struct {
 	conn *websocket.Conn
 	mu   *sync.Mutex
+	// teardown closes the browser connection (with a close frame) so a
+	// Deepgram-side close/error propagates to the client and unblocks the
+	// handler's read loop. Safe to call multiple times.
+	teardown func(code int, reason string)
+	// closing is set once an intentional shutdown is under way; while set, the
+	// transport-close "error" the SDK synthesizes from Deepgram's socket close
+	// is not forwarded to the browser as a spurious Error frame.
+	closing *atomic.Bool
 }
 
 // sendJSON marshals a Deepgram response and writes it as a text frame.
@@ -200,13 +209,25 @@ func (c *ttsCallback) Clear(cl *speakmsg.ClearedResponse) error {
 	c.sendJSON(cl)
 	return nil
 }
-func (c *ttsCallback) Close(cr *speakmsg.CloseResponse) error { return nil }
+func (c *ttsCallback) Close(cr *speakmsg.CloseResponse) error {
+	// Deepgram closed the connection; close the browser session so the read
+	// loop returns instead of blocking until the browser happens to disconnect.
+	c.teardown(websocket.CloseNormalClosure, "")
+	return nil
+}
 func (c *ttsCallback) Warning(wr *speakmsg.WarningResponse) error {
 	c.sendJSON(wr)
 	return nil
 }
 func (c *ttsCallback) Error(er *speakmsg.ErrorResponse) error {
+	// During an intentional shutdown the SDK reports Deepgram's socket close as
+	// an error; don't forward that as a data frame. A real mid-session error
+	// (closing not set) is still surfaced, then the session is torn down.
+	if c.closing.Load() {
+		return nil
+	}
 	c.sendJSON(er)
+	c.teardown(websocket.CloseInternalServerErr, "Deepgram error")
 	return nil
 }
 func (c *ttsCallback) UnhandledEvent(byData []byte) error { return nil }
@@ -259,6 +280,13 @@ func handleLiveTTSProxy(cfg Config) http.HandlerFunc {
 		if sr, err := strconv.Atoi(sampleRate); err == nil {
 			tOptions.SampleRate = sr
 		}
+		// The reference frontend sends container=none (Deepgram's default), which
+		// this path preserves. WSSpeakOptions does not model `container`, so a
+		// non-default container request cannot be forwarded through the typed
+		// SDK options — surface that instead of dropping it silently.
+		if container := query.Get("container"); container != "" && container != "none" {
+			log.Printf("Warning: container=%q requested but the SDK's WSSpeakOptions does not support a container field; using Deepgram's default (none)", container)
+		}
 
 		log.Printf("Connecting to Deepgram TTS: model=%s, encoding=%s, sample_rate=%s", model, encoding, sampleRate)
 
@@ -270,9 +298,25 @@ func handleLiveTTSProxy(cfg Config) http.HandlerFunc {
 			clientConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(code, msg))
 		}
 
+		// teardown tears down the browser session exactly once: send a close
+		// frame, close the connection (which unblocks clientConn.ReadMessage in
+		// the pump below), and signal `done`. Invoked by the SDK callback on a
+		// Deepgram close/error, or after a client Close is drained.
+		done := make(chan struct{})
+		closing := &atomic.Bool{}
+		var closeOnce sync.Once
+		teardown := func(code int, reason string) {
+			closeOnce.Do(func() {
+				closing.Store(true)
+				closeToClient(code, reason)
+				clientConn.Close()
+				close(done)
+			})
+		}
+
 		// Connect to Deepgram Live TTS using the official Go SDK (speak WebSocket).
 		cOptions := &dginterfaces.ClientOptions{}
-		callback := &ttsCallback{conn: clientConn, mu: writeMu}
+		callback := &ttsCallback{conn: clientConn, mu: writeMu, teardown: teardown, closing: closing}
 
 		dgClient, err := speak.NewWSUsingCallback(context.Background(), cfg.DeepgramAPIKey, cOptions, tOptions, callback)
 		if err != nil {
@@ -324,7 +368,19 @@ func handleLiveTTSProxy(cfg Config) http.HandlerFunc {
 					log.Printf("Flush failed: %v", err)
 				}
 			case "Close", "CloseStream":
-				closeToClient(websocket.CloseNormalClosure, "")
+				// Let Deepgram flush any in-flight audio before closing: Stop()
+				// sends the close control message and waits for the server to
+				// finish, during which the final audio frames are delivered to
+				// the browser via the Binary callback. The Close callback then
+				// tears down; a bounded wait guards against a missing close.
+				closing.Store(true)
+				go dgClient.Stop()
+				select {
+				case <-done:
+				case <-time.After(5 * time.Second):
+					log.Println("Timed out waiting for Deepgram to finalize after Close")
+					teardown(websocket.CloseNormalClosure, "")
+				}
 				return
 			}
 		}
