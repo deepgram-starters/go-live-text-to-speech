@@ -216,7 +216,13 @@ func (c *ttsCallback) Close(cr *speakmsg.CloseResponse) error {
 	return nil
 }
 func (c *ttsCallback) Warning(wr *speakmsg.WarningResponse) error {
-	c.sendJSON(wr)
+	// Hand-built for the same reason as Error below: WarningResponse aliases
+	// DeepgramWarning, which has no json:"type" tag and maps its code to
+	// json:"warn_code", so a direct marshal emits {"Type":"Warning",...}.
+	c.sendJSON(map[string]any{
+		"type":        "Warning",
+		"description": wr.Description,
+	})
 	return nil
 }
 func (c *ttsCallback) Error(er *speakmsg.ErrorResponse) error {
@@ -226,7 +232,19 @@ func (c *ttsCallback) Error(er *speakmsg.ErrorResponse) error {
 	if c.closing.Load() {
 		return nil
 	}
-	c.sendJSON(er)
+	// Hand-build the frame instead of marshaling the SDK struct. ErrorResponse
+	// is an alias for DeepgramError, which has no json:"type" tag, so a direct
+	// marshal emits {"Type":"Error",...} (capital T) and the frontend's
+	// `msg.type === 'Error'` check never matches. Its code field is tagged
+	// json:"err_code" rather than json:"code", so the wire code is dropped on
+	// unmarshal and ErrCode is always empty; these Errors are connection-level
+	// in any case, which is what CONNECTION_FAILED means in the live TTS
+	// error contract.
+	c.sendJSON(map[string]any{
+		"type":        "Error",
+		"description": er.Description,
+		"code":        "CONNECTION_FAILED",
+	})
 	c.teardown(websocket.CloseInternalServerErr, "Deepgram error")
 	return nil
 }
