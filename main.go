@@ -47,7 +47,6 @@ import (
 // Config holds the application configuration loaded from environment variables.
 type Config struct {
 	DeepgramAPIKey string
-	DeepgramTTSURL string
 	Port           string
 	Host           string
 	SessionSecret  string
@@ -82,9 +81,10 @@ func loadConfig() Config {
 		sessionSecret = hex.EncodeToString(b)
 	}
 
+	// The Deepgram endpoint is not configured here: the SDK derives it from
+	// ClientOptions (override the host with cOptions.Host if you need to).
 	return Config{
 		DeepgramAPIKey: apiKey,
-		DeepgramTTSURL: "wss://api.deepgram.com/v1/speak",
 		Port:           port,
 		Host:           host,
 		SessionSecret:  sessionSecret,
@@ -154,16 +154,88 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-// activeConnections tracks all active client WebSocket connections for graceful shutdown.
+// activeConnections maps each active client WebSocket connection to its
+// teardown function, so graceful shutdown can close it through the same
+// serialized, deadline-bounded write path the proxy itself uses.
 var activeConnections sync.Map
+
+// browserWriteTimeout bounds every write to the browser socket. A stalled
+// browser (backgrounded tab, full TCP receive window) must not block the
+// Deepgram client: the SDK fires its Close callback while holding its
+// connection mutex, so an unbounded write from that callback would deadlock
+// the SDK's read loop, every write to Deepgram, and the deferred Stop().
+const browserWriteTimeout = 5 * time.Second
+
+// deepgramDrainTimeout is a last-resort ceiling on the Close drain. The normal
+// path ends when Deepgram closes its own socket, however long that takes.
+const deepgramDrainTimeout = 30 * time.Second
+
+// controlMessage is a bare Deepgram control frame. The SDK models this type
+// internally but does not export it, so control messages it has no typed method
+// for (Clear) are written through the raw WSClient.WriteJSON below.
+type controlMessage struct {
+	Type string `json:"type"`
+}
+
+// browserConn wraps the client WebSocket. Both the SDK's callback goroutine and
+// the handler write to it, and gorilla panics on concurrent writes, so every
+// write must go through these methods.
+type browserConn struct {
+	conn *websocket.Conn
+	mu   sync.Mutex
+}
+
+// write serializes a single frame to the browser under a write deadline.
+func (b *browserConn) write(msgType int, data []byte) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := b.conn.SetWriteDeadline(time.Now().Add(browserWriteTimeout)); err != nil {
+		return err
+	}
+	return b.conn.WriteMessage(msgType, data)
+}
+
+// sendJSON marshals a value and writes it to the browser as a text frame.
+func (b *browserConn) sendJSON(v interface{}) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		log.Printf("Failed to marshal TTS event: %v", err)
+		return
+	}
+	if err := b.write(websocket.TextMessage, data); err != nil {
+		log.Printf("Failed to forward TTS event to client: %v", err)
+	}
+}
+
+// sendError emits the nested Error frame the live TTS contract requires:
+// {"type":"Error","error":{"type","code","message"}} — see
+// contracts/interfaces/live-text-to-speech/schema/error.json. `code` must be
+// one of the contract's enum values.
+func (b *browserConn) sendError(errType, code, message string) {
+	b.sendJSON(map[string]any{
+		"type": "Error",
+		"error": map[string]any{
+			"type":    errType,
+			"code":    code,
+			"message": message,
+		},
+	})
+}
+
+// close sends a close frame and closes the socket.
+func (b *browserConn) close(code int, reason string) {
+	if err := b.write(websocket.CloseMessage, websocket.FormatCloseMessage(code, reason)); err != nil {
+		log.Printf("Failed to send close frame to client: %v", err)
+	}
+	b.conn.Close()
+}
 
 // ttsCallback implements the Deepgram SDK SpeakMessageCallback interface and
 // relays Live TTS events to the browser WebSocket: audio as binary frames and
 // control/status messages as JSON text frames, preserving the wire format the
 // frontend already expects.
 type ttsCallback struct {
-	conn *websocket.Conn
-	mu   *sync.Mutex
+	client *browserConn
 	// teardown closes the browser connection (with a close frame) so a
 	// Deepgram-side close/error propagates to the client and unblocks the
 	// handler's read loop. Safe to call multiple times.
@@ -174,39 +246,43 @@ type ttsCallback struct {
 	closing *atomic.Bool
 }
 
-// sendJSON marshals a Deepgram response and writes it as a text frame.
-func (c *ttsCallback) sendJSON(v interface{}) {
-	data, err := json.Marshal(v)
-	if err != nil {
-		log.Printf("Failed to marshal TTS event: %v", err)
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
-		log.Printf("Failed to forward TTS event to client: %v", err)
-	}
-}
-
 func (c *ttsCallback) Open(or *speakmsg.OpenResponse) error { return nil }
 func (c *ttsCallback) Metadata(md *speakmsg.MetadataResponse) error {
-	c.sendJSON(md)
+	// Frames are hand-built rather than re-marshaled from the SDK struct: every
+	// field on these types is tagged `omitempty`, so a direct marshal silently
+	// drops contract-required keys whose value happens to be the zero value.
+	//
+	// KNOWN GAP: the contract's MetadataEvent also requires model_name,
+	// model_version and model_uuid, and Deepgram does send all three, but the
+	// SDK's MetadataResponse models only type and request_id — the rest are
+	// discarded during unmarshal, before this callback runs, so they cannot be
+	// recovered here. Closing it needs those fields on the SDK struct.
+	c.client.sendJSON(map[string]any{
+		"type":       "Metadata",
+		"request_id": md.RequestID,
+	})
 	return nil
 }
 func (c *ttsCallback) Binary(byMsg []byte) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if err := c.conn.WriteMessage(websocket.BinaryMessage, byMsg); err != nil {
+	if err := c.client.write(websocket.BinaryMessage, byMsg); err != nil {
 		log.Printf("Failed to forward TTS audio to client: %v", err)
 	}
 	return nil
 }
 func (c *ttsCallback) Flush(fl *speakmsg.FlushedResponse) error {
-	c.sendJSON(fl)
+	// sequence_id is contract-required and Deepgram's first ack in a session is
+	// 0, which `omitempty` on the SDK struct would drop.
+	c.client.sendJSON(map[string]any{
+		"type":        "Flushed",
+		"sequence_id": fl.SequenceID,
+	})
 	return nil
 }
 func (c *ttsCallback) Clear(cl *speakmsg.ClearedResponse) error {
-	c.sendJSON(cl)
+	c.client.sendJSON(map[string]any{
+		"type":        "Cleared",
+		"sequence_id": cl.SequenceID,
+	})
 	return nil
 }
 func (c *ttsCallback) Close(cr *speakmsg.CloseResponse) error {
@@ -216,10 +292,12 @@ func (c *ttsCallback) Close(cr *speakmsg.CloseResponse) error {
 	return nil
 }
 func (c *ttsCallback) Warning(wr *speakmsg.WarningResponse) error {
-	// Hand-built for the same reason as Error below: WarningResponse aliases
-	// DeepgramWarning, which has no json:"type" tag and maps its code to
-	// json:"warn_code", so a direct marshal emits {"Type":"Warning",...}.
-	c.sendJSON(map[string]any{
+	// Deepgram's Warning frame is {type, description, code}, but the SDK's
+	// WarningResponse (an alias for DeepgramWarning) has no json:"type" tag and
+	// tags its code field json:"warn_code", which never matches the wire key —
+	// so the code is already gone by the time this callback runs and cannot be
+	// forwarded. Closing that gap needs a json:"code" field on the SDK struct.
+	c.client.sendJSON(map[string]any{
 		"type":        "Warning",
 		"description": wr.Description,
 	})
@@ -232,23 +310,31 @@ func (c *ttsCallback) Error(er *speakmsg.ErrorResponse) error {
 	if c.closing.Load() {
 		return nil
 	}
-	// Hand-build the frame instead of marshaling the SDK struct. ErrorResponse
-	// is an alias for DeepgramError, which has no json:"type" tag, so a direct
-	// marshal emits {"Type":"Error",...} (capital T) and the frontend's
-	// `msg.type === 'Error'` check never matches. Its code field is tagged
-	// json:"err_code" rather than json:"code", so the wire code is dropped on
-	// unmarshal and ErrCode is always empty; these Errors are connection-level
-	// in any case, which is what CONNECTION_FAILED means in the live TTS
-	// error contract.
-	c.sendJSON(map[string]any{
-		"type":        "Error",
-		"description": er.Description,
-		"code":        "CONNECTION_FAILED",
-	})
+	// Deepgram's streaming /v1/speak API has no Error event, so everything that
+	// reaches this callback is a transport failure the SDK synthesized from a
+	// socket error — which is what CONNECTION_FAILED means in the contract's
+	// error enum. The upstream code is unavailable either way: ErrorResponse
+	// aliases DeepgramError, whose code field is tagged json:"err_code".
+	message := er.Description
+	if message == "" {
+		message = er.ErrMsg
+	}
+	if message == "" {
+		message = "Deepgram connection error"
+	}
+	c.client.sendError("connection_error", "CONNECTION_FAILED", message)
 	c.teardown(websocket.CloseInternalServerErr, "Deepgram error")
 	return nil
 }
-func (c *ttsCallback) UnhandledEvent(byData []byte) error { return nil }
+func (c *ttsCallback) UnhandledEvent(byData []byte) error {
+	// Stay transparent, as the pre-SDK byte-relay proxy was: message types the
+	// SDK does not model reach this callback with their original bytes, so
+	// forward them verbatim instead of swallowing them.
+	if err := c.client.write(websocket.TextMessage, byData); err != nil {
+		log.Printf("Failed to forward unmodeled TTS event to client: %v", err)
+	}
+	return nil
+}
 
 // handleLiveTTSProxy proxies WebSocket messages between the client and Deepgram's Live TTS API.
 func handleLiveTTSProxy(cfg Config) http.HandlerFunc {
@@ -273,8 +359,9 @@ func handleLiveTTSProxy(cfg Config) http.HandlerFunc {
 		defer clientConn.Close()
 
 		log.Println("Client connected to /api/live-text-to-speech")
-		activeConnections.Store(clientConn, true)
-		defer activeConnections.Delete(clientConn)
+
+		// Every write to the browser goes through this wrapper.
+		client := &browserConn{conn: clientConn}
 
 		// Parse query parameters from the WebSocket URL
 		query := r.URL.Query()
@@ -290,69 +377,86 @@ func handleLiveTTSProxy(cfg Config) http.HandlerFunc {
 		if sampleRate == "" {
 			sampleRate = "24000"
 		}
+		// Reject an unparseable sample_rate instead of leaving SampleRate at 0:
+		// omitting it makes Deepgram apply its 24 kHz default while the frontend
+		// keeps decoding at the rate it asked for, which plays back at the wrong
+		// speed with no error anywhere.
+		sr, err := strconv.Atoi(sampleRate)
+		if err != nil {
+			log.Printf("Rejecting connection: invalid sample_rate=%q", sampleRate)
+			client.sendError("invalid_request", "CONNECTION_FAILED",
+				fmt.Sprintf("invalid sample_rate %q: expected an integer", sampleRate))
+			client.close(websocket.CloseUnsupportedData, "invalid sample_rate")
+			return
+		}
 		// Build Deepgram Live TTS options from the forwarded query params.
 		tOptions := &dginterfaces.WSSpeakOptions{
-			Model:    model,
-			Encoding: encoding,
+			Model:      model,
+			Encoding:   encoding,
+			SampleRate: sr,
 		}
-		if sr, err := strconv.Atoi(sampleRate); err == nil {
-			tOptions.SampleRate = sr
-		}
-		// The reference frontend sends container=none (Deepgram's default), which
-		// this path preserves. WSSpeakOptions does not model `container`, so a
-		// non-default container request cannot be forwarded through the typed
-		// SDK options — surface that instead of dropping it silently.
+		// The reference frontend sends container=none, the only meaningful value
+		// here: Deepgram's streaming /v1/speak API has no container concept, so
+		// it always returns bare audio. Surface a non-default request instead of
+		// dropping it silently.
 		if container := query.Get("container"); container != "" && container != "none" {
-			log.Printf("Warning: container=%q requested but the SDK's WSSpeakOptions does not support a container field; using Deepgram's default (none)", container)
+			log.Printf("Warning: ignoring container=%q — Deepgram's streaming /v1/speak API has no container parameter and always returns raw %s audio", container, encoding)
 		}
 
-		log.Printf("Connecting to Deepgram TTS: model=%s, encoding=%s, sample_rate=%s", model, encoding, sampleRate)
-
-		// Serialize all writes to the browser connection (callback + close frames).
-		writeMu := &sync.Mutex{}
-		closeToClient := func(code int, msg string) {
-			writeMu.Lock()
-			defer writeMu.Unlock()
-			clientConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(code, msg))
-		}
+		log.Printf("Connecting to Deepgram TTS: model=%s, encoding=%s, sample_rate=%d", model, encoding, sr)
 
 		// teardown tears down the browser session exactly once: send a close
 		// frame, close the connection (which unblocks clientConn.ReadMessage in
 		// the pump below), and signal `done`. Invoked by the SDK callback on a
-		// Deepgram close/error, or after a client Close is drained.
+		// Deepgram close/error, by graceful shutdown, or after a client Close is
+		// drained.
 		done := make(chan struct{})
 		closing := &atomic.Bool{}
 		var closeOnce sync.Once
 		teardown := func(code int, reason string) {
 			closeOnce.Do(func() {
 				closing.Store(true)
-				closeToClient(code, reason)
-				clientConn.Close()
+				client.close(code, reason)
 				close(done)
 			})
 		}
 
-		// Connect to Deepgram Live TTS using the official Go SDK (speak WebSocket).
-		cOptions := &dginterfaces.ClientOptions{}
-		callback := &ttsCallback{conn: clientConn, mu: writeMu, teardown: teardown, closing: closing}
+		// Register the teardown, not the raw connection: graceful shutdown must
+		// not write to this socket without holding the write mutex.
+		activeConnections.Store(clientConn, teardown)
+		defer activeConnections.Delete(clientConn)
 
-		dgClient, err := speak.NewWSUsingCallback(context.Background(), cfg.DeepgramAPIKey, cOptions, tOptions, callback)
+		// Connect to Deepgram Live TTS using the official Go SDK (speak WebSocket).
+		dgCtx, dgCancel := context.WithCancel(context.Background())
+		defer dgCancel()
+		cOptions := &dginterfaces.ClientOptions{}
+		callback := &ttsCallback{client: client, teardown: teardown, closing: closing}
+
+		dgClient, err := speak.NewWSUsingCallbackWithCancel(dgCtx, dgCancel, cfg.DeepgramAPIKey, cOptions, tOptions, callback)
 		if err != nil {
 			log.Printf("Failed to create Deepgram TTS client: %v", err)
-			closeToClient(websocket.CloseInternalServerErr, "Deepgram connection failed")
+			client.sendError("connection_error", "CONNECTION_FAILED", "Deepgram connection failed")
+			client.close(websocket.CloseInternalServerErr, "Deepgram connection failed")
 			return
 		}
 
-		if !dgClient.Connect() {
-			log.Printf("Deepgram TTS connection failed")
-			closeToClient(websocket.CloseInternalServerErr, "Deepgram connection failed")
+		// One attempt, not the SDK's default of three: the usual causes here (a
+		// bad API key, an unknown model) are not retryable, and the SDK's 2s
+		// backoff would stall the browser for ~4s before reporting the same
+		// failure. The upstream HTTP status is only logged by the SDK itself, at
+		// LogLevelElevated — see the Init call in main().
+		if !dgClient.ConnectWithCancel(dgCtx, dgCancel, 1) {
+			log.Printf("Deepgram TTS connection failed: check DEEPGRAM_API_KEY and the model=%s / encoding=%s / sample_rate=%d combination", model, encoding, sr)
+			client.sendError("connection_error", "CONNECTION_FAILED", "Deepgram connection failed")
+			client.close(websocket.CloseInternalServerErr, "Deepgram connection failed")
 			return
 		}
 		defer dgClient.Stop()
 
 		log.Println("Connected to Deepgram TTS API")
 
-		// Pump control messages (Speak / Flush) from the browser to Deepgram.
+		// Pump control messages (Speak / Flush / Clear / Close) from the browser
+		// to Deepgram.
 		for {
 			msgType, data, err := clientConn.ReadMessage()
 			if err != nil {
@@ -385,24 +489,45 @@ func handleLiveTTSProxy(cfg Config) http.HandlerFunc {
 				if err := dgClient.Flush(); err != nil {
 					log.Printf("Flush failed: %v", err)
 				}
+			case "Clear":
+				// Forwarded verbatim rather than via the SDK's Reset(), which
+				// emits {"type":"Reset"} — a message the Live TTS API does not
+				// model, so barge-in would never cancel the queued audio.
+				if err := dgClient.WSClient.WriteJSON(controlMessage{Type: "Clear"}); err != nil {
+					log.Printf("Clear failed: %v", err)
+				}
 			case "Close", "CloseStream":
-				// Let Deepgram flush any in-flight audio before closing: Stop()
-				// sends the close control message and waits for the server to
-				// finish, during which the final audio frames are delivered to
-				// the browser via the Binary callback. The Close callback then
-				// tears down; a bounded wait guards against a missing close.
-				closing.Store(true)
-				go dgClient.Stop()
+				// Deepgram's Close drains the text buffer, delivers the
+				// remaining audio and then closes the socket, so the drain ends
+				// when that close arrives (SDK Close callback -> teardown ->
+				// done) — not on a local timer. dgClient.Stop() cannot be used
+				// here: it closes the socket itself after two 100ms sleeps,
+				// truncating anything still in flight.
+				if err := dgClient.WSClient.WriteJSON(controlMessage{Type: "Close"}); err != nil {
+					log.Printf("Close failed: %v", err)
+					teardown(websocket.CloseInternalServerErr, "Deepgram close failed")
+					return
+				}
 				select {
 				case <-done:
-				case <-time.After(5 * time.Second):
+				case <-time.After(deepgramDrainTimeout):
 					log.Println("Timed out waiting for Deepgram to finalize after Close")
 					teardown(websocket.CloseNormalClosure, "")
 				}
 				return
+			default:
+				// Stay transparent: forward control messages this proxy does not
+				// model straight through rather than discarding them.
+				log.Printf("Forwarding unrecognized control message type %q verbatim", ctrl.Type)
+				if err := dgClient.WSClient.WriteJSON(json.RawMessage(data)); err != nil {
+					log.Printf("Forwarding %q failed: %v", ctrl.Type, err)
+				}
 			}
 		}
 
+		// The browser is gone, so the close frames the deferred Stop() triggers
+		// are not worth reporting to it as Error frames.
+		closing.Store(true)
 		log.Println("WebSocket proxy session ended")
 	}
 }
@@ -468,7 +593,9 @@ func corsMiddleware(next http.Handler) http.Handler {
 func main() {
 	cfg := loadConfig()
 
-	// Initialize the Deepgram Go SDK.
+	// Initialize the Deepgram Go SDK. Raise this to speak.LogLevelElevated to see
+	// the SDK log the upstream HTTP status when a connection is rejected (a 401
+	// for a bad API key, for example); it is chatty, so the default stays here.
 	speak.InitWithDefault()
 
 	mux := http.NewServeMux()
@@ -494,13 +621,18 @@ func main() {
 		sig := <-sigChan
 		log.Printf("\n%s signal received: starting graceful shutdown...", sig)
 
-		// Close all active WebSocket connections
+		// Close all active WebSocket connections. Each connection's teardown is
+		// used rather than a direct WriteMessage: writing here without the
+		// connection's write mutex races the SDK's audio callback, and gorilla's
+		// concurrent-write detection would panic this goroutine (crashing the
+		// process) instead of shutting down cleanly.
 		count := 0
 		activeConnections.Range(func(key, value interface{}) bool {
-			conn := key.(*websocket.Conn)
-			conn.WriteMessage(websocket.CloseMessage,
-				websocket.FormatCloseMessage(websocket.CloseGoingAway, "Server shutting down"))
-			conn.Close()
+			teardown, ok := value.(func(code int, reason string))
+			if !ok {
+				return true
+			}
+			teardown(websocket.CloseGoingAway, "Server shutting down")
 			count++
 			return true
 		})

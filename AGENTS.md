@@ -85,14 +85,21 @@ Frontend: `cd frontend && corepack pnpm install`
 ## Customization Guide
 
 ### Changing Default Parameters
-The WebSocket connection URL passes parameters to Deepgram. Modify these in the backend where the Deepgram URL is constructed:
+The frontend passes these as query parameters on the WebSocket URL. The backend
+reads them in `handleLiveTTSProxy` and sets them on the SDK's
+`dginterfaces.WSSpeakOptions`, which is what the Deepgram Go SDK turns into the
+upstream connection — the backend never builds the Deepgram URL itself. To change
+the Deepgram host, set `cOptions.Host` on the `ClientOptions` value next to it.
 
 | Parameter | Default | Options | Effect |
 |-----------|---------|---------|--------|
 | `model` | `aura-asteria-en` | Any aura-* voice | Voice selection |
 | `encoding` | `linear16` | `linear16`, `mp3`, `opus`, `mulaw`, `alaw` | Audio encoding |
-| `sample_rate` | `48000` | `8000`-`48000` | Audio sample rate |
-| `container` | `none` | `none`, `wav`, `ogg` | Audio container |
+| `sample_rate` | `24000` (the frontend sends `48000`) | `8000`-`48000` | Audio sample rate; a non-integer value is rejected at connect time |
+
+Deepgram's streaming `/v1/speak` API has no `container` parameter — it always
+returns bare audio — so a `container` other than `none` is ignored with a warning
+in the server log. (`container` exists only on the REST `/v1/speak` endpoint.)
 
 **Important:** The frontend audio playback is configured for Linear16 at 48kHz. If you change encoding or sample_rate, you MUST update the frontend's AudioContext and PCM conversion code in `frontend/main.js`.
 
@@ -101,9 +108,27 @@ The client sends JSON messages to generate audio:
 - `{ "type": "Speak", "text": "Hello world" }` — Queue text for synthesis
 - `{ "type": "Flush" }` — Signal end of text, flush audio buffer
 - `{ "type": "Clear" }` — Cancel pending audio
-- `{ "type": "Close" }` — Graceful disconnect
+- `{ "type": "Close" }` — Graceful disconnect: Deepgram drains the remaining audio, then closes
 
-The server streams back binary audio chunks (raw PCM when container=none).
+`Speak` and `Flush` go through the SDK's typed methods. `Clear` and `Close` are
+written straight to the socket with `dgClient.WSClient.WriteJSON` — the SDK has no
+`Clear` method (its `Reset()` sends `{"type":"Reset"}`, which Live TTS does not
+model), and its `Stop()` closes the socket too early to drain. Any other control
+type is forwarded verbatim, so the proxy stays transparent.
+
+The server streams back binary audio chunks (raw PCM for `linear16`), plus
+`Metadata`, `Flushed`, `Cleared`, `Warning` and `Error` JSON frames. `Error`
+frames use the nested contract shape:
+`{ "type": "Error", "error": { "type", "code", "message" } }`, where `code` is one
+of the contract enum values in
+`contracts/interfaces/live-text-to-speech/schema/error.json`.
+
+**Known gap:** the contract requires `model_name`, `model_version` and
+`model_uuid` on the `Metadata` frame. Deepgram sends all three, but the Go SDK's
+`MetadataResponse` models only `type` and `request_id`, so they are dropped during
+unmarshal and cannot be forwarded. Same for the `code` on `Warning` frames
+(`DeepgramWarning` tags it `json:"warn_code"`, which never matches the wire key).
+Both need SDK-side fixes.
 
 ### Changing the Voice Mid-Stream
 You can send multiple `Speak` messages with different text. The voice is set at connection time via the `model` parameter. To change voice, you need to reconnect.
@@ -129,7 +154,9 @@ The frontend is a git submodule from `deepgram-starters/live-text-to-speech-html
 1. Add the HTML element in `frontend/index.html` (input, checkbox, dropdown, etc.)
 2. Read the value in `frontend/main.js` when making the API call or opening the WebSocket
 3. Pass it as a query parameter in the WebSocket URL
-4. Handle it in the backend `main.go` — read the param and pass it to the Deepgram API
+4. Handle it in the backend `main.go` — read the param in `handleLiveTTSProxy` and
+   set it on `dginterfaces.WSSpeakOptions` (if the SDK models no field for it, say
+   so in a log line rather than dropping it silently)
 
 ## Environment Variables
 
