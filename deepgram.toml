@@ -6,7 +6,7 @@ repository = "https://github.com/deepgram-starters/go-live-text-to-speech"
 useCase = "live-text-to-speech"
 language = "go"
 framework = "go"
-sdk = "N/A"
+sdk = "deepgram-go-sdk"
 tags = ["live-text-to-speech", "live-tts", "streaming-tts", "real-time-tts", "streaming-text-to-speech", "go"]
 
 [check]
